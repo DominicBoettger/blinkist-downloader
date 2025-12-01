@@ -131,78 +131,303 @@ const downloadBooks = async (page: Page, list: library = 'saved') => {
     console.log(`Downloading book (${dbList.length - i} left):`, book.url);
     const gql = page.waitForResponse(r => r.request().method() == 'POST' && r.url() == 'https://gql-gateway.blinkist.com/graphql');
     await page.goto('https://www.blinkist.com/en/app/books/' + book.id);
-    const contentState = (await (await gql).json()).data.user.contentStateByContentTypeAndId;
-    const detailsBox = page.locator('div:has(h4)').last();
+    
+    // Try to get content state from GraphQL response, but don't fail if it's not available
+    let contentState = undefined;
     try {
-      await detailsBox.waitFor({ timeout: 15000 });
+      const response = await gql;
+      const json = await response.json();
+      contentState = json?.data?.user?.contentStateByContentTypeAndId;
     } catch (error) {
-      // e.g. https://www.blinkist.com/en/app/books/bulletproof-diet-en
-      // redirected in JS to https://www.blinkist.com/en/app/for-you?missing-title=bulletproof-diet-en
-      console.error(chalk.red('Missing book:'), book.id);
-      console.error('Error:', error);
-      console.log();
-      fs.mkdirSync(bookDir, { recursive: true });
-      continue;
+      console.log('Could not get contentState from GraphQL:', (error as Error).message);
     }
-    const detailDivs = await detailsBox.locator('div').all();
-    const categories = await detailDivs[1].locator('a').all().then(a => Promise.all(a.map(a => a.innerText())));
-    const descriptionLong = await detailDivs[2].innerHTML();
-    const authorDetails = await detailDivs[3].innerHTML();
-    const ratings = await page.locator('span:has-text(" ratings)")').innerText({ timeout: 200 }).catch(() => undefined); // e.g. 3.9 (89 ratings); may not exist
-    const durationDetail = await page.locator('span:has-text(" mins")').innerText(); // e.g. 15 mins
+    
+    // Try multiple selectors to find the details section (page structure may have changed)
+    const detailsBoxSelectors = [
+      'div:has(h4)',  // original selector
+      '[data-test-id="book-details"]',  // common test id pattern
+      'section:has(h4)',  // might be a section now
+      'div[class*="details"]',  // any div with "details" in class name
+    ];
+    
+    let detailsBox = null;
+    for (const selector of detailsBoxSelectors) {
+      detailsBox = page.locator(selector).last();
+      try {
+        await detailsBox.waitFor({ timeout: 3000 });
+        console.log(`Found details box with selector: ${selector}`);
+        break;
+      } catch {
+        detailsBox = null;
+      }
+    }
+    
+    // Try to extract details from the page
+    let categories: string[] = [];
+    let descriptionLong = book.description || '';
+    let authorDetails = book.author || '';
+    let ratings = undefined;
+    let durationDetail = undefined;
+    
+    if (detailsBox) {
+      try {
+        const detailDivs = await detailsBox.locator('div').all();
+        console.log(`Found ${detailDivs.length} detail divs`);
+        
+        // Try to extract information with fallbacks
+        if (detailDivs.length >= 2) {
+          categories = await detailDivs[1].locator('a').all().then(a => Promise.all(a.map(a => a.innerText()))).catch(() => []);
+        }
+        if (detailDivs.length >= 3) {
+          descriptionLong = await detailDivs[2].innerHTML().catch(() => book.description || '');
+        }
+        if (detailDivs.length >= 4) {
+          authorDetails = await detailDivs[3].innerHTML().catch(() => book.author || '');
+        }
+      } catch (error) {
+        console.log('Error extracting details from detailsBox:', (error as Error).message);
+      }
+    } else {
+      console.log(chalk.yellow('Could not find details box, using basic metadata from library'));
+    }
+    
+    // Try to get ratings and duration from anywhere on the page
+    ratings = await page.locator('span:has-text(" ratings)")').innerText({ timeout: 200 }).catch(() => undefined);
+    durationDetail = await page.locator('span:has-text(" mins")').innerText({ timeout: 200 }).catch(() => undefined);
+    
     const details = { ...book, ratings, durationDetail, categories, descriptionLong, authorDetails, contentState };
     console.log('Details:', details);
 
     const chapters = [];
     let orgChapter = undefined;
-    const resp = await page.goto('https://www.blinkist.com/en/nc/reader/' + book.id);
-    if (resp && resp.status() !== 404) {
-      await page.locator('.reader-content__text').waitFor(); // wait for content to load
-      // chapter number (Introduction, Key idea 1...), but last chapter (summary) has no name, so we time out and return Summary
-      const chapterNumber = () => page.locator('[data-test-id="currentChapterNumber"]').innerText({ timeout: 200 }).catch(() => 'Summary');
-      orgChapter = await chapterNumber();
-      console.log('Original chapter:', orgChapter);
-      const reset = async () => {
-        const chapter = await chapterNumber();
-        if (chapter === 'Introduction') return;
-        await page.locator('[data-test-id="keyIdeas"]').click(); // open Key ideas chapter menu
-        await page.locator('[data-test-id="chapterLink"]').first().click(); // go to first chapter (Introduction)
-        while (chapter === await chapterNumber()) {
-          // console.log('Waiting for 200ms...');
-          await page.waitForTimeout(200);
+    
+    // Set up network monitoring to capture audio URLs BEFORE they become blobs
+    // This must be done BEFORE navigation to the reader page
+    let currentAudioUrls: string[] = [];
+    
+    const audioHandler = async (response: any) => {
+      try {
+        const url = response.url();
+        // Skip blob URLs entirely
+        if (url.startsWith('blob:')) {
+          return;
+        }
+        const contentType = response.headers()['content-type'] || '';
+        // Capture any audio files or media URLs (but not blobs)
+        if (url.includes('.m4a') || url.includes('.mp3') || url.includes('.aac') || 
+            url.includes('/audio/') || url.includes('/media/') ||
+            contentType.includes('audio/')) {
+          console.log(chalk.cyan(`  ✓ Captured audio URL: ${url}`));
+          currentAudioUrls.push(url);
+        }
+      } catch (e) {
+        // Ignore errors from handler
+      }
+    };
+    
+    page.on('response', audioHandler);
+    
+    // Try to download chapters from reader
+    try {
+      const resp = await page.goto('https://www.blinkist.com/en/nc/reader/' + book.id);
+      console.log('Reader response status:', resp?.status());
+      
+      if (resp && resp.status() === 404) {
+        console.error(chalk.yellow('Reader not found (404):'), book.id);
+      } else {
+        // Try multiple selectors for reader content (page structure may have changed)
+        const readerContentSelectors = [
+          '.reader-content__text',  // original selector
+          '[class*="reader-content"]',  // any class with reader-content
+          '[class*="ReaderContent"]',  // camelCase version
+          'article',  // might be in an article tag
+          '[data-test-id*="reader"]',  // any test id with reader
+        ];
+        
+        let readerContentVisible = false;
+        let workingSelector = '';
+        
+        for (const selector of readerContentSelectors) {
+          const visible = await page.locator(selector).first().waitFor({ timeout: 3000 }).then(() => true).catch(() => false);
+          if (visible) {
+            readerContentVisible = true;
+            workingSelector = selector;
+            console.log(`Found reader content with selector: ${selector}`);
+            break;
+          }
+        }
+        
+        if (!readerContentVisible) {
+          console.error(chalk.yellow('Reader content did not load with any known selector:'), book.id);
+          console.log('Current URL:', page.url());
+          // Try to log what elements are actually on the page
+          const bodyClasses = await page.locator('body').getAttribute('class').catch(() => 'N/A');
+          console.log('Body classes:', bodyClasses);
+          const mainElements = await page.locator('main, article, [role="main"]').count();
+          console.log('Main/article elements found:', mainElements);
+          // Check if we were redirected
+          if (!page.url().includes('/reader/')) {
+            console.log('Page was redirected away from reader');
+          }
+        } else {
+          // chapter number (Introduction, Key idea 1...), but last chapter (summary) has no name, so we time out and return Summary
+          const chapterNumber = () => page.locator('[data-test-id="currentChapterNumber"]').innerText({ timeout: 200 }).catch(() => 'Summary');
+          orgChapter = await chapterNumber();
+          console.log('Original chapter:', orgChapter);
+          
+          // Try to navigate to the first chapter
+          const reset = async () => {
+            const chapter = await chapterNumber();
+            if (chapter === 'Introduction' || chapter === 'Einleitung') {
+              console.log('Already at Introduction');
+              return;
+            }
+            
+            console.log(`Currently at: ${chapter}, trying to navigate to first chapter`);
+            
+            // Look for chapter links INSIDE the chapters list
+            const chapterListContainer = page.locator('[data-test-id="chapters-list"]');
+            const hasChapterList = await chapterListContainer.count() > 0;
+            
+            if (hasChapterList) {
+              console.log('Found chapters list container, analyzing chapter structure');
+              
+              // Get the HTML structure to understand how to navigate
+              const listHtml = await chapterListContainer.innerHTML().catch(() => '');
+              console.log('Chapters list HTML preview:', listHtml.slice(0, 500));
+              
+              // Try to use keyboard navigation instead of clicking
+              console.log('Attempting keyboard navigation to first chapter');
+              try {
+                // Focus on the chapters list
+                await chapterListContainer.focus({ timeout: 1000 }).catch(() => {});
+                // Press ArrowDown to go to first chapter
+                await page.keyboard.press('ArrowDown');
+                await page.waitForTimeout(300);
+                // Press Enter to select
+                await page.keyboard.press('Enter');
+                await page.waitForTimeout(800);
+                
+                const newChapter = await chapterNumber();
+                if (newChapter !== chapter) {
+                  console.log(chalk.green(`✓ Navigated via keyboard from ${chapter} to ${newChapter}`));
+                } else {
+                  console.log(chalk.yellow('Keyboard navigation did not change chapter'));
+                }
+              } catch (e) {
+                console.log(`Keyboard navigation failed: ${(e as Error).message.split('\n')[0]}`);
+              }
+            } else {
+              console.log('No chapters list container found');
+            }
+            
+            const finalChapter = await chapterNumber();
+            console.log('Final position:', finalChapter);
+          };
+          
+          await reset();
+          
+          // Now iterate through all chapters
+          do {
+            const name = await chapterNumber();
+            const title = await page.locator('h2').first().innerText().catch(() => 'Untitled');
+            console.log(name, title);
+            
+            // Use the working selector for reader content
+            const text = await page.locator(workingSelector).first().innerHTML();
+            
+            // Check if we already have audio from page load
+            let audio = null;
+            if (currentAudioUrls.length > 0) {
+              // Use the last captured URL (most recent)
+              audio = currentAudioUrls[currentAudioUrls.length - 1];
+              console.log(chalk.green(`✓ Using pre-loaded audio URL: ${audio.slice(0, 80)}...`));
+            } else {
+              // Try to trigger audio load by clicking play button
+              console.log(chalk.dim('  Trying to trigger audio load...'));
+              const playButtonSelectors = [
+                'button[aria-label*="Play"]',
+                'button[aria-label*="Abspielen"]',
+                '[data-test-id*="play"]',
+                'button:has([data-icon="play"])',
+              ];
+              
+              for (const selector of playButtonSelectors) {
+                const btn = page.locator(selector).first();
+                if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+                  console.log(chalk.dim(`  Clicking play button: ${selector}`));
+                  try {
+                    await btn.click({ timeout: 1000 });
+                    // Wait a bit for audio to start loading
+                    await page.waitForTimeout(1500);
+                    break;
+                  } catch (e) {
+                    console.log(chalk.dim(`  Could not click: ${(e as Error).message.split('\n')[0]}`));
+                  }
+                }
+              }
+              
+              // Check again if we captured audio after clicking play
+              if (currentAudioUrls.length > 0) {
+                audio = currentAudioUrls[currentAudioUrls.length - 1];
+                console.log(chalk.green(`✓ Captured audio after play: ${audio.slice(0, 80)}...`));
+              } else {
+                console.log(chalk.yellow('  No audio captured from network for this chapter'));
+              }
+            }
+            
+            const chapter = { name, title, text, audio };
+            chapters.push(chapter);
+            
+            // Clear audio URLs for next chapter
+            currentAudioUrls = [];
+            
+            const nextBtn = page.locator('[data-test-id="nextChapter"]');
+            if (await nextBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+              await nextBtn.click();
+              // Wait for chapter to change and for new audio to potentially load
+              await page.waitForTimeout(800);
+              const nextTitle = await page.locator('h2').first().innerText().catch(() => '');
+              // Additional wait if title hasn't changed yet
+              if (title === nextTitle) {
+                await page.waitForTimeout(500);
+              }
+            } else {
+              console.log('No more next button, reached end');
+              break;
+            }
+          } while (true);
+          
+          // Try to reset to original chapter
+          await reset();
         }
       }
-      await reset();
-      do {
-        const name = await chapterNumber();
-        const title = await page.locator('h2').first().innerText();
-        console.log(name, title);
-        const text = await page.locator('.reader-content__text').first().innerHTML();
-        const audio = await page.locator('[data-test-id="readerAudio"]').getAttribute('audio-url');
-        const chapter = { name, title, text, audio };
-        chapters.push(chapter);
-        const nextBtn = page.locator('[data-test-id="nextChapter"]');
-        if (await nextBtn.isVisible()) {
-          await nextBtn.click();
-          while (title === await page.locator('h2').first().innerText()) {
-            // console.log('Waiting for 200ms...');
-            await page.waitForTimeout(200);
-          }
-        } else break;
-      } while (true);
-      await reset();
-    } else {
-      console.error('Book not found:', book.id);
+    } catch (error) {
+      console.error(chalk.yellow('Error accessing reader for book:'), book.id);
+      console.error('Error:', (error as Error).message);
     }
 
     // write data at the end
     fs.mkdirSync(bookDir, { recursive: true });
     fs.writeFileSync(bookJson, JSON.stringify({ ...details, downloadDate: new Date(), orgChapter, chapters }, null, 2));
     await downloadFile(book.img, bookDir + 'cover.png');
+    
+    console.log(`Downloaded book with ${chapters.length} chapters`);
+    if (chapters.length === 0) {
+      console.log(chalk.yellow('Warning: No chapters were downloaded. The book content may not be available.'));
+    }
+    
     if (cfg.audio) {
-      console.log('Downloading audio files:', chapters.filter(c => c.audio).length);
-      for (const { name, audio } of chapters) {
-        if (audio) await downloadFile(audio, bookDir + name + '.m4a');
+      const chaptersWithAudio = chapters.filter(c => c.audio);
+      console.log(`Downloading audio files: ${chaptersWithAudio.length} of ${chapters.length} chapters have audio`);
+      for (const { name, audio } of chaptersWithAudio) {
+        if (audio) {
+          console.log(`  Downloading audio for: ${name}`);
+          await downloadFile(audio, bookDir + name + '.m4a');
+        }
+      }
+      if (chaptersWithAudio.length === 0 && chapters.length > 0) {
+        console.log(chalk.yellow('Warning: No audio URLs found in chapters'));
       }
     }
     console.log();
