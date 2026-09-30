@@ -12,7 +12,8 @@
   "bin": "index.ts",
   "type": "module",
   "scripts": {
-    "start": "tsx ./index.ts"
+    "start": "tsx ./index.ts",
+    "test": "tsx --test download-file.test.ts"
   },
   "dependencies": {
     "chalk": "^5.3.0",
