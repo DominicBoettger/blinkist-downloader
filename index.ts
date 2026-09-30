@@ -5,6 +5,7 @@ import { context, page } from './playwright.js';
 import type { BrowserContext, Page } from 'playwright-chromium';
 import fs from 'node:fs';
 import chalk from 'chalk';
+import { downloadFile } from './download-file.js';
 
 type library = 'saved' | 'finished';
 type book = {
@@ -105,8 +106,6 @@ const updateLibrary = async (page: Page, list: library = 'saved') => {
   console.log('New books:', newBooks.length);
   console.log();
 };
-
-const downloadFile = (url: string, path: string) => fetch(url).then(res => res.arrayBuffer()).then(bytes => fs.writeFileSync(path, Buffer.from(bytes)));
 
 const downloadBooks = async (page: Page, list: library = 'saved') => {
   const dbList = db.data[list]; // sorted by date added ascending
@@ -217,7 +216,7 @@ const downloadBooks = async (page: Page, list: library = 'saved') => {
         if (url.includes('.m4a') || url.includes('.mp3') || url.includes('.aac') || 
             url.includes('/audio/') || url.includes('/media/') ||
             contentType.includes('audio/')) {
-          console.log(chalk.cyan(`  ✓ Captured audio URL: ${url}`));
+          console.log(chalk.cyan('  ✓ Captured audio source'));
           currentAudioUrls.push(url);
         }
       } catch (e) {
@@ -341,7 +340,7 @@ const downloadBooks = async (page: Page, list: library = 'saved') => {
             if (currentAudioUrls.length > 0) {
               // Use the last captured URL (most recent)
               audio = currentAudioUrls[currentAudioUrls.length - 1];
-              console.log(chalk.green(`✓ Using pre-loaded audio URL: ${audio.slice(0, 80)}...`));
+              console.log(chalk.green('✓ Using pre-loaded audio source'));
             } else {
               // Try to trigger audio load by clicking play button
               console.log(chalk.dim('  Trying to trigger audio load...'));
@@ -370,7 +369,7 @@ const downloadBooks = async (page: Page, list: library = 'saved') => {
               // Check again if we captured audio after clicking play
               if (currentAudioUrls.length > 0) {
                 audio = currentAudioUrls[currentAudioUrls.length - 1];
-                console.log(chalk.green(`✓ Captured audio after play: ${audio.slice(0, 80)}...`));
+                console.log(chalk.green('✓ Captured audio after play'));
               } else {
                 console.log(chalk.yellow('  No audio captured from network for this chapter'));
               }
@@ -405,6 +404,8 @@ const downloadBooks = async (page: Page, list: library = 'saved') => {
     } catch (error) {
       console.error(chalk.yellow('Error accessing reader for book:'), book.id);
       console.error('Error:', (error as Error).message);
+    } finally {
+      page.off('response', audioHandler);
     }
 
     // write data at the end
