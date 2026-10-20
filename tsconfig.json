@@ -1,4 +1,6 @@
 {
-  // "extends": "@total-typescript/tsconfig/bundler/no-dom/app"
-  "extends": "@tsconfig/node21/tsconfig.json"
+  "extends": "@tsconfig/node21/tsconfig.json",
+  "compilerOptions": {
+    "lib": ["es2023", "dom"]
+  }
 }

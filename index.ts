@@ -37,7 +37,7 @@ const login = async (page: Page) => {
   return Promise.any([page.waitForURL(/.*login.*/).then(() => {
     console.error('Not logged in! Will wait for 120s for you to log in...');
     return page.waitForTimeout(120*1000);
-  }), page.locator('h3:has-text("Saved")').waitFor()]);
+  }), page.getByRole('heading', { name: 'Saved', exact: true }).waitFor()]);
 }
 
 const updateLibrary = async (page: Page, list: library = 'saved') => {
@@ -50,12 +50,18 @@ const updateLibrary = async (page: Page, list: library = 'saved') => {
   console.log('Updating library:', url);
   console.log(list, 'books in db.json:', dbList.length);
 
-  const listItems = page.locator(`div:has-text("${list}") p`);
+  await page.getByRole('heading', { name: list === 'saved' ? 'Saved' : 'Finished', exact: true }).waitFor();
+  const pageCardsSelector = 'a[data-test-id="book-card"], a[data-testid="content-item-card"]';
+  const pageCards = page.locator(pageCardsSelector);
+  const bookCards = page.locator('a[data-test-id="book-card"], a[data-testid="content-item-card"][href*="/books/"]');
+  // A heading can render before the library request completes. Do not silently
+  // persist an empty list unless the page explicitly reports an empty library.
+  await page.waitForFunction(selector => document.querySelector(selector)
+    || /\b0\s+of\s+0\s+titles\b/i.test(document.body.innerText), pageCardsSelector);
   const nextBtn = page.locator('button:has-text("Next"):not([disabled])');
   pages: do { // go through pages
-    const items = await listItems.innerText();
-    console.log('Current page:', items);
-    const books = await page.locator('a[data-test-id="book-card"]').all();
+    const items = await pageCards.evaluateAll(cards => cards.map(card => card.getAttribute('href')).join('\n'));
+    const books = await bookCards.all();
     for (const book of books) {
       const slug = await book.getAttribute('href');
       if (!slug) throw new Error('Book has no href attribute!');
@@ -65,10 +71,10 @@ const updateLibrary = async (page: Page, list: library = 'saved') => {
       if (!title) throw new Error('Book has no title / aria-label attribute!');
       const img = await book.locator('img').getAttribute('src');
       if (!img) throw new Error('Book has no img src attribute!');
-      const author = await book.locator('[data-test-id="subtitle"]').innerText();
-      const description = await book.locator('[data-test-id="description"]').innerText();
+      const author = await book.locator('[data-test-id="subtitle"], [data-testid="subtitle"]').innerText();
+      const description = await book.locator('[data-test-id="description"], [data-testid="description"]').innerText();
       // const details = await book.locator('div:below([data-test-id="description"])').innerText();
-      let meta = (await book.locator('div.text-mid-grey.text-caption.mt-2').last().innerText()).split('\n');
+      let meta = (await book.locator('[data-testid="content-card-info"], div.text-mid-grey.text-caption.mt-2').first().innerText()).split('\n');
       const duration = parseFloat(meta[0].replace(' min', ''));
       const rating = parseFloat(meta[1]);
       const item: book = { id, title, author, description, duration, rating, url, img };
@@ -92,11 +98,13 @@ const updateLibrary = async (page: Page, list: library = 'saved') => {
     // await page.pause();
     if (await nextBtn.count()) { // while next button is not disabled; can't check this in do-while condition since it would already be false after click()
       await nextBtn.click(); // click next page button
-      // wait until items on page have been updated
-      while (items === await listItems.innerText()) {
-        // console.log('Waiting for 500ms...');
-        await page.waitForTimeout(500);
-      }
+      // The title counter may remain unchanged between pages. Wait for card
+      // identities instead, with Playwright's configured timeout.
+      await page.waitForFunction(({ selector, previous }) => {
+        const current = Array.from(document.querySelectorAll(selector))
+          .map(card => card.getAttribute('href')).join('\n');
+        return current.length > 0 && current !== previous;
+      }, { selector: pageCardsSelector, previous: items });
     } else break;
   } while (true);
   // add new books to db.json in reverse order
